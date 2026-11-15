@@ -249,7 +249,141 @@ class TestCachingAndDynamicOutput(unittest.TestCase):
                 self.assertEqual(mock_open2.call_count, 0)
                 self.assertEqual(rec2["response"], fake_payload)
 
-    def test_cmd_search_dynamic_headers_and_children_age_param(self) -> None:
+    def test_resolve_destination_exact_and_ambiguous(self) -> None:
+        minsk_Poland_list = [
+            {
+                "dest_id": "-516724",
+                "search_type": "city",
+                "name": "Mińsk Mazowiecki",
+                "label": "Mińsk Mazowiecki, Masovia, Poland",
+                "country": "Poland",
+                "nr_hotels": 18,
+            },
+            {
+                "dest_id": "900127650",
+                "search_type": "landmark",
+                "name": "Minskoff Theatre",
+                "label": "Minskoff Theatre, New York, New York, United States",
+                "country": "United States",
+                "nr_hotels": 128,
+            },
+        ]
+        # "Minsk" does not match "Mińsk Mazowiecki" -> ambiguous
+        chosen, candidates = booking_search.resolve_destination(minsk_Poland_list, "Minsk")
+        self.assertIsNone(chosen)
+        self.assertEqual(len(candidates), 2)
+
+        # "Minsk, Belarus" does not match Poland -> ambiguous
+        chosen_by, _ = booking_search.resolve_destination(minsk_Poland_list, "Minsk, Belarus")
+        self.assertIsNone(chosen_by)
+
+        # Explicit "Mińsk Mazowiecki" or "Minsk Mazowiecki, Poland" -> unambiguous
+        chosen_mm, _ = booking_search.resolve_destination(minsk_Poland_list, "Minsk Mazowiecki, Poland")
+        self.assertIsNotNone(chosen_mm)
+        self.assertEqual(chosen_mm["dest_id"], "-516724")
+
+        # Multiple cities with the same name in different countries -> ambiguous unless country specified
+        brest_list = [
+            {
+                "dest_id": "-1414765",
+                "search_type": "city",
+                "name": "Brest",
+                "label": "Brest, Brittany, France",
+                "country": "France",
+                "nr_hotels": 95,
+            },
+            {
+                "dest_id": "-1942131",
+                "search_type": "city",
+                "name": "Brest",
+                "label": "Brest, Brest Region, Belarus",
+                "country": "Belarus",
+                "nr_hotels": 40,
+            },
+        ]
+        chosen_brest, brest_cands = booking_search.resolve_destination(brest_list, "Brest")
+        self.assertIsNone(chosen_brest)
+        self.assertEqual(len(brest_cands), 2)
+
+        chosen_brest_fr, _ = booking_search.resolve_destination(brest_list, "Brest, France")
+        self.assertIsNotNone(chosen_brest_fr)
+        self.assertEqual(chosen_brest_fr["dest_id"], "-1414765")
+
+    def test_cmd_search_stops_on_ambiguous_destination_without_calling_search_hotels(self) -> None:
+        dest_record = {
+            "endpoint": "searchDestination",
+            "ratelimit": {"x-ratelimit-requests-remaining": "14", "x-ratelimit-requests-limit": "20"},
+            "response": {
+                "status": True,
+                "data": [
+                    {
+                        "dest_id": "-516724",
+                        "search_type": "city",
+                        "name": "Mińsk Mazowiecki",
+                        "label": "Mińsk Mazowiecki, Masovia, Poland",
+                        "country": "Poland",
+                        "nr_hotels": 18,
+                    }
+                ],
+            },
+        }
+        with (
+            mock.patch.dict(os.environ, {"RAPIDAPI_KEY": "k"}, clear=True),
+            mock.patch.object(booking_search, "cached_get", return_value=(dest_record, True)) as mock_get,
+        ):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = booking_search.main(
+                    [
+                        "search",
+                        "--query",
+                        "Minsk",
+                        "--arrival",
+                        "2027-01-01",
+                        "--departure",
+                        "2027-01-07",
+                    ]
+                )
+            self.assertEqual(rc, 2)
+            self.assertEqual(mock_get.call_count, 1)
+            self.assertEqual(mock_get.call_args[0][0], "searchDestination")
+            text = out.getvalue()
+            self.assertIn("Ambiguous or non-exact destination match", text)
+            self.assertIn("Mińsk Mazowiecki, Masovia, Poland", text)
+            self.assertIn("dest_id=-516724", text)
+
+    def test_build_booking_url_includes_dates_and_occupancy(self) -> None:
+        url_with_children = booking_search.build_booking_url(
+            hotel_id=13553290,
+            arrival="2027-01-01",
+            departure="2027-01-07",
+            adults=2,
+            rooms=1,
+            children_ages="4,9",
+        )
+        self.assertEqual(
+            url_with_children,
+            "https://www.booking.com/searchresults.html?"
+            "dest_id=13553290&dest_type=hotel&checkin=2027-01-01&checkout=2027-01-07"
+            "&group_adults=2&no_rooms=1&group_children=2&age=4&age=9",
+        )
+
+        url_adults_only = booking_search.build_booking_url(
+            hotel_id="555",
+            arrival="2027-05-01",
+            departure="2027-05-04",
+            adults=2,
+            rooms=1,
+            children_ages=None,
+        )
+        self.assertEqual(
+            url_adults_only,
+            "https://www.booking.com/searchresults.html?"
+            "dest_id=555&dest_type=hotel&checkin=2027-05-01&checkout=2027-05-04"
+            "&group_adults=2&no_rooms=1&group_children=0",
+        )
+
+    def test_cmd_search_outputs_only_name_and_booking_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "cache"
             sample_hotels = {
@@ -270,7 +404,15 @@ class TestCachingAndDynamicOutput(unittest.TestCase):
                                 "recommendedUnitsConfigurationLabel": "<b>Entire apartment – 40 m²</b>: 2 beds",
                                 "priceBreakdown": {"grossPrice": {"value": 450.0, "currency": "EUR"}},
                             },
-                        }
+                        },
+                        {
+                            "hotel_id": 777,
+                            "accessibilityLabel": "City Hotel.\nHotel room : 1 bed.",
+                            "property": {
+                                "name": "City Hotel",
+                                "priceBreakdown": {"grossPrice": {"value": 300.0, "currency": "EUR"}},
+                            },
+                        },
                     ]
                 },
             }
@@ -284,7 +426,7 @@ class TestCachingAndDynamicOutput(unittest.TestCase):
                 mock.patch.dict(os.environ, {"RAPIDAPI_KEY": "k", "BOOKING_CACHE_DIR": str(cache_dir)}, clear=True),
                 mock.patch.object(booking_search, "cached_get", return_value=(record, True)) as mock_get,
             ):
-                # 3 nights, unfiltered (min_sqm=0 default), with children ages
+                # Unfiltered (min_sqm=0 default), with children ages
                 out_3n = io.StringIO()
                 with contextlib.redirect_stdout(out_3n):
                     rc = booking_search.main(
@@ -306,13 +448,19 @@ class TestCachingAndDynamicOutput(unittest.TestCase):
                     )
                 self.assertEqual(rc, 0)
                 text_3n = out_3n.getvalue()
-                self.assertIn("Total Price (3 nights)", text_3n)
-                self.assertIn("| Disclosed Size |", text_3n)
-                self.assertIn("| 40 m² |", text_3n)
+                self.assertIn("| Name | Review | Total Price (3 nights) | Booking.com URL |", text_3n)
+                self.assertNotIn("Hotel ID", text_3n)
+                self.assertIn(
+                    "| Alpine Inn | 9.2 (Wonderful, 42) | 450.00 EUR | "
+                    "https://www.booking.com/searchresults.html?"
+                    "dest_id=555&dest_type=hotel&checkin=2027-05-01&checkout=2027-05-04"
+                    "&group_adults=2&no_rooms=1&group_children=2&age=4&age=9 |",
+                    text_3n,
+                )
                 called_params = mock_get.call_args[0][1]
                 self.assertEqual(called_params["children_age"], "4,9")
 
-                # 1 night, min_sqm=30
+                # Filtered by min_sqm=30
                 out_1n = io.StringIO()
                 with contextlib.redirect_stdout(out_1n):
                     rc2 = booking_search.main(
@@ -330,9 +478,10 @@ class TestCachingAndDynamicOutput(unittest.TestCase):
                     )
                 self.assertEqual(rc2, 0)
                 text_1n = out_1n.getvalue()
-                self.assertIn("Total Price (1 night)", text_1n)
-                self.assertIn("| Size Status (>=30 m²) |", text_1n)
-                self.assertIn("Confirmed >= 30 m² (40 m²)", text_1n)
+                self.assertIn("### Confirmed >= 30 m²", text_1n)
+                self.assertIn("### Needs getRoomList check", text_1n)
+                self.assertIn("| Name | Review | Total Price (1 night) | Booking.com URL |", text_1n)
+                self.assertNotIn("Hotel ID", text_1n)
 
     def test_cmd_rooms_passes_children_age_and_formats_output(self) -> None:
         sample_rooms = {
@@ -383,6 +532,12 @@ class TestCachingAndDynamicOutput(unittest.TestCase):
             self.assertEqual(rc, 0)
             output = out.getvalue()
             self.assertIn("Family Suite | 36 m² | 980.00 EUR", output)
+            self.assertIn(
+                "Booking.com URL: https://www.booking.com/searchresults.html?"
+                "dest_id=999&dest_type=hotel&checkin=2027-06-10&checkout=2027-06-15"
+                "&group_adults=2&no_rooms=1&group_children=1&age=6",
+                output,
+            )
             self.assertNotIn("Compact Single", output)
             called_params = mock_get.call_args[0][1]
             self.assertEqual(called_params["children_age"], "6")

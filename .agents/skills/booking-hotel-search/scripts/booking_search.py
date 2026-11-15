@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -314,26 +315,120 @@ def print_ratelimit(record: dict[str, Any], from_cache: bool) -> None:
     print(f"Quota: remaining={remaining}, limit={limit}, reset_sec={reset}")
 
 
-def select_best_destination(dest_list: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
-    """Pick the best matching destination from searchDestination results."""
+def _normalize_for_match(text: str) -> str:
+    """Normalize text to lowercase ASCII alphanumeric tokens for matching."""
+    replacements = str.maketrans(
+        {
+            "ł": "l",
+            "Ł": "l",
+            "ß": "ss",
+            "ø": "o",
+            "Ø": "o",
+            "đ": "d",
+            "Đ": "d",
+        }
+    )
+    trans = (text or "").translate(replacements)
+    decomposed = unicodedata.normalize("NFKD", trans)
+    ascii_only = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    cleaned = re.sub(r"[^a-z0-9]+", " ", ascii_only.lower())
+    return " ".join(cleaned.split())
+
+
+def resolve_destination(
+    dest_list: list[dict[str, Any]],
+    query: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Resolve an unambiguous destination from searchDestination results.
+
+    Returns (chosen_destination, candidate_list). If the query does not exactly
+    match a candidate name (and any country/region qualifiers) or if multiple
+    candidates match, returns (None, candidates_to_present_to_user).
+    """
     if not dest_list:
-        return None
-    q = query.strip().lower()
+        return None, []
+
+    q_norm = _normalize_for_match(query)
+    if not q_norm:
+        return None, dest_list
+
+    if "," in query:
+        parts = [_normalize_for_match(p) for p in query.split(",") if _normalize_for_match(p)]
+        primary = parts[0] if parts else q_norm
+        qualifiers = parts[1:]
+    else:
+        primary = q_norm
+        qualifiers = []
 
     def is_city(d: dict[str, Any]) -> bool:
         return str(d.get("search_type") or d.get("dest_type") or "").upper() == "CITY"
 
-    for pred in (
-        lambda d: is_city(d) and str(d.get("name") or "").strip().lower() == q,
-        lambda d: is_city(d) and q in str(d.get("name") or "").lower(),
-        lambda d: is_city(d),
-        lambda d: str(d.get("name") or "").strip().lower() == q,
-        lambda d: q in str(d.get("name") or "").lower(),
-    ):
-        match = next((d for d in dest_list if pred(d)), None)
-        if match is not None:
-            return match
-    return dest_list[0]
+    def has_qualifiers(context: str, quals: list[str]) -> bool:
+        return all(re.search(rf"\b{re.escape(q)}\b", context) is not None for q in quals)
+
+    exact_matches: list[dict[str, Any]] = []
+    for d in dest_list:
+        cand_name = _normalize_for_match(str(d.get("name") or d.get("city_name") or ""))
+        cand_label = _normalize_for_match(str(d.get("label") or ""))
+        cand_country = _normalize_for_match(str(d.get("country") or ""))
+        cand_region = _normalize_for_match(str(d.get("region") or ""))
+        cand_context = f"{cand_label} {cand_country} {cand_region}".strip()
+
+        if not cand_name:
+            continue
+
+        if (cand_name == primary or cand_label == q_norm) and has_qualifiers(cand_context, qualifiers):
+            exact_matches.append(d)
+        elif not qualifiers and q_norm.startswith(cand_name + " "):
+            rem = q_norm[len(cand_name) :].strip()
+            if rem and has_qualifiers(cand_context, [rem]):
+                exact_matches.append(d)
+
+    city_matches = [d for d in exact_matches if is_city(d)]
+    if len(city_matches) == 1:
+        return city_matches[0], city_matches
+    if len(city_matches) > 1:
+        return None, city_matches
+    if len(exact_matches) == 1:
+        return exact_matches[0], exact_matches
+    if len(exact_matches) > 1:
+        return None, exact_matches
+    return None, dest_list
+
+
+def build_booking_url(
+    hotel_id: str | int,
+    arrival: str,
+    departure: str,
+    adults: int = 2,
+    rooms: int = 1,
+    children_ages: str | None = None,
+) -> str:
+    """Build a Booking.com URL for a property pre-filled with dates and occupancy."""
+    query_pairs: list[tuple[str, str]] = [
+        ("dest_id", str(hotel_id)),
+        ("dest_type", "hotel"),
+        ("checkin", arrival),
+        ("checkout", departure),
+        ("group_adults", str(adults)),
+        ("no_rooms", str(rooms)),
+    ]
+    if children_ages:
+        ages = [a.strip() for a in children_ages.split(",") if a.strip()]
+        query_pairs.append(("group_children", str(len(ages))))
+        for age in ages:
+            query_pairs.append(("age", age))
+    else:
+        query_pairs.append(("group_children", "0"))
+    return f"https://www.booking.com/searchresults.html?{urllib.parse.urlencode(query_pairs)}"
+
+
+def _print_hotel_url_table(rows: list[dict[str, Any]], price_header: str) -> None:
+    """Print a markdown table of Hotel Name, Review, Total Price, and Booking.com URL."""
+    print(f"| Name | Review | {price_header} | Booking.com URL |")
+    print("|---|---|---:|---|")
+    for row in rows:
+        print(f"| {row['name']} | {row['review']} | {row['price_str']} | {row['url']} |")
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -353,10 +448,23 @@ def cmd_search(args: argparse.Namespace) -> int:
         if not isinstance(dest_list, list) or not dest_list:
             print("No destinations found in searchDestination response.")
             return 1
-        chosen = select_best_destination(dest_list, args.query)
+        chosen, candidates = resolve_destination(dest_list, args.query)
         if chosen is None:
-            print(f"No destination found for query={args.query!r}.")
-            return 1
+            print(
+                f"Ambiguous or non-exact destination match for query={args.query!r}. "
+                "Ask the user to clarify which destination they want (or re-run with --dest-id):"
+            )
+            for cand in candidates:
+                c_id = cand.get("dest_id")
+                c_type = str(cand.get("search_type") or cand.get("dest_type") or "CITY").upper()
+                c_name = cand.get("name")
+                c_label = cand.get("label")
+                c_hotels = cand.get("nr_hotels")
+                print(
+                    f"- dest_id={c_id} | search_type={c_type} | "
+                    f"name={c_name!r} | label={c_label!r} | nr_hotels={c_hotels}"
+                )
+            return 2
         dest_id = str(chosen.get("dest_id"))
         search_type = str(chosen.get("search_type") or "CITY").upper()
         print(
@@ -401,14 +509,6 @@ def cmd_search(args: argparse.Namespace) -> int:
         prop = item.get("property") or {}
         hotel_id = item.get("hotel_id") or prop.get("id") or "N/A"
         name = clean_text(str(prop.get("name") or "Unknown")).replace("|", "/")
-        stars_val = prop.get("propertyClass") or prop.get("accuratePropertyClass")
-        quality_val = prop.get("qualityClass")
-        if stars_val:
-            stars = f"{stars_val}★"
-        elif quality_val:
-            stars = f"{quality_val} (Q)"
-        else:
-            stars = "—"
         score = prop.get("reviewScore")
         score_word = prop.get("reviewScoreWord") or ""
         rev_count = prop.get("reviewCount")
@@ -418,35 +518,53 @@ def cmd_search(args: argparse.Namespace) -> int:
             else (f"{score}" if score else "—")
         )
         price_val, price_str = format_price(prop)
-        location = extract_location(item).replace("|", "/")
-        unit_desc, size_status = extract_unit_and_size(item, min_sqm=args.min_sqm)
-        unit_desc = unit_desc.replace("|", "/")
+        _, size_status = extract_unit_and_size(item, min_sqm=args.min_sqm)
+        url = build_booking_url(
+            hotel_id=hotel_id,
+            arrival=args.arrival,
+            departure=args.departure,
+            adults=args.adults,
+            rooms=args.rooms,
+            children_ages=normalized_ages,
+        )
         rows.append(
             {
                 "hotel_id": hotel_id,
                 "name": name,
-                "location": location,
-                "stars": stars,
                 "review": review_str,
                 "price_val": price_val,
                 "price_str": price_str,
-                "unit_desc": unit_desc,
+                "url": url,
                 "size_status": size_status,
             }
         )
 
     rows.sort(key=lambda r: r["price_val"])
-
     price_header = f"Total Price ({nights} night{'s' if nights != 1 else ''})"
-    size_header = f"Size Status (>={args.min_sqm:g} m²)" if args.min_sqm > 0 else "Disclosed Size"
 
-    print(f"| # | Hotel ID | Name | Location | Class | Review | {price_header} | Lead Unit | {size_header} |")
-    print("|---:|---:|---|---|---:|---|---:|---|---|")
-    for idx, row in enumerate(rows, start=1):
-        print(
-            f"| {idx} | `{row['hotel_id']}` | {row['name']} | {row['location']} | {row['stars']} | "
-            f"{row['review']} | {row['price_str']} | {row['unit_desc']} | {row['size_status']} |"
-        )
+    if args.min_sqm > 0:
+        confirmed = [r for r in rows if r["size_status"].startswith("Confirmed >=")]
+        needs_check = [r for r in rows if r["size_status"] == "Needs getRoomList check"]
+        smaller = [
+            r
+            for r in rows
+            if not r["size_status"].startswith("Confirmed >=")
+            and r["size_status"] != "Needs getRoomList check"
+        ]
+        if confirmed:
+            print(f"### Confirmed >= {args.min_sqm:g} m²")
+            _print_hotel_url_table(confirmed, price_header)
+            print()
+        if needs_check:
+            print("### Needs getRoomList check")
+            _print_hotel_url_table(needs_check, price_header)
+            print()
+        if smaller:
+            print(f"### Lead unit < {args.min_sqm:g} m² (check other rooms)")
+            _print_hotel_url_table(smaller, price_header)
+            print()
+    else:
+        _print_hotel_url_table(rows, price_header)
     return 0
 
 
@@ -519,8 +637,17 @@ def cmd_rooms(args: argparse.Namespace) -> int:
             params["children_age"] = normalized_ages
 
         record, from_cache = cached_get("getRoomList", params, api_key)
+        hotel_url = build_booking_url(
+            hotel_id=hid,
+            arrival=args.arrival,
+            departure=args.departure,
+            adults=args.adults,
+            rooms=args.rooms,
+            children_ages=normalized_ages,
+        )
         print(f"\n=== Hotel ID {hid} ===")
         print_ratelimit(record, from_cache)
+        print(f"Booking.com URL: {hotel_url}")
         matches = parse_rooms_from_payload(record.get("response") or {}, min_sqm=args.min_sqm)
         if not matches:
             if args.min_sqm > 0:
